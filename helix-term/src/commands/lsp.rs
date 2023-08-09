@@ -138,7 +138,7 @@ struct DiagnosticStyles {
 }
 
 struct PickerDiagnostic {
-    url: lsp::Url,
+    path: PathBuf,
     diag: lsp::Diagnostic,
     offset_encoding: OffsetEncoding,
 }
@@ -171,8 +171,7 @@ impl ui::menu::Item for PickerDiagnostic {
         let path = match format {
             DiagnosticsFormat::HideSourcePath => String::new(),
             DiagnosticsFormat::ShowSourcePath => {
-                let file_path = self.url.to_file_path().unwrap();
-                let path = path::get_truncated_path(file_path);
+                let path = path::get_truncated_path(&self.path);
                 format!("{}: ", path.to_string_lossy())
             }
         };
@@ -262,21 +261,21 @@ enum DiagnosticsFormat {
 
 fn diag_picker(
     cx: &Context,
-    diagnostics: BTreeMap<lsp::Url, Vec<(lsp::Diagnostic, usize)>>,
-    _current_path: Option<lsp::Url>,
+    diagnostics: BTreeMap<PathBuf, Vec<(lsp::Diagnostic, usize)>>,
+    current_path: Option<PathBuf>,
     format: DiagnosticsFormat,
 ) -> Picker<PickerDiagnostic> {
     // TODO: drop current_path comparison and instead use workspace: bool flag?
 
     // flatten the map to a vec of (url, diag) pairs
     let mut flat_diag = Vec::new();
-    for (url, diags) in diagnostics {
+    for (path, diags) in diagnostics {
         flat_diag.reserve(diags.len());
 
         for (diag, ls) in diags {
             if let Some(ls) = cx.editor.language_server_by_id(ls) {
                 flat_diag.push(PickerDiagnostic {
-                    url: url.clone(),
+                    path: path.clone(),
                     diag,
                     offset_encoding: ls.offset_encoding(),
                 });
@@ -296,22 +295,31 @@ fn diag_picker(
         (styles, format),
         move |cx,
               PickerDiagnostic {
-                  url,
+                  path,
                   diag,
                   offset_encoding,
               },
               action| {
-            jump_to_location(
-                cx.editor,
-                &lsp::Location::new(url.clone(), diag.range),
-                *offset_encoding,
-                action,
-            )
+            if current_path.as_ref() == Some(path) {
+                let (view, doc) = current!(cx.editor);
+                push_jump(view, doc);
+            } else {
+                cx.editor.open(path, action).expect("editor.open failed");
+            }
+
+            let (view, doc) = current!(cx.editor);
+
+            if let Some(range) = lsp_range_to_range(doc.text(), diag.range, *offset_encoding) {
+                // we flip the range so that the cursor sits on the start of the symbol
+                // (for example start of the function).
+                doc.set_selection(view.id, Selection::single(range.head, range.anchor));
+                align_view(doc, view, Align::Center);
+            }
         },
     )
-    .with_preview(move |_editor, PickerDiagnostic { url, diag, .. }| {
-        let location = lsp::Location::new(url.clone(), diag.range);
-        Some(location_to_file_location(&location))
+    .with_preview(move |_editor, PickerDiagnostic { path, diag, .. }| {
+        let line = Some((diag.range.start.line as usize, diag.range.end.line as usize));
+        Some((path.clone().into(), line))
     })
     .truncate_start(false)
 }
@@ -474,17 +482,12 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
 
 pub fn diagnostics_picker(cx: &mut Context) {
     let doc = doc!(cx.editor);
-    if let Some(current_url) = doc.url() {
-        let diagnostics = cx
-            .editor
-            .diagnostics
-            .get(&current_url)
-            .cloned()
-            .unwrap_or_default();
+    if let Some(path) = doc.path() {
+        let diagnostics = cx.editor.diagnostics.get(path).cloned().unwrap_or_default();
         let picker = diag_picker(
             cx,
-            [(current_url.clone(), diagnostics)].into(),
-            Some(current_url),
+            [(path.clone(), diagnostics)].into(),
+            Some(path.clone()),
             DiagnosticsFormat::HideSourcePath,
         );
         cx.push_layer(Box::new(overlaid(picker)));
@@ -493,13 +496,13 @@ pub fn diagnostics_picker(cx: &mut Context) {
 
 pub fn workspace_diagnostics_picker(cx: &mut Context) {
     let doc = doc!(cx.editor);
-    let current_url = doc.url();
+    let current_path = doc.path();
     // TODO not yet filtered by LanguageServerFeature, need to do something similar as Document::shown_diagnostics here for all open documents
     let diagnostics = cx.editor.diagnostics.clone();
     let picker = diag_picker(
         cx,
         diagnostics,
-        current_url,
+        current_path.cloned(),
         DiagnosticsFormat::ShowSourcePath,
     );
     cx.push_layer(Box::new(overlaid(picker)));
